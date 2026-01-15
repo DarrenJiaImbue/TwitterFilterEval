@@ -156,7 +156,17 @@ def main():
                         if 'correct' in row:
                             st.markdown(f"**Correct:** {'✅' if row['correct'] else '❌'}")
 
-                    if 'reasoning' in row and pd.notna(row['reasoning']):
+                    # Display both original and new reasoning if available
+                    if 'original_reasoning' in row and pd.notna(row['original_reasoning']):
+                        st.markdown("**Original Reasoning (Sonnet 4.5 - Initial):**")
+                        st.info(row['original_reasoning'])
+
+                    if 'new_reasoning' in row and pd.notna(row['new_reasoning']):
+                        st.markdown("**New Reasoning:**")
+                        st.success(row['new_reasoning'])
+
+                    # Fallback for older format with just 'reasoning'
+                    if 'reasoning' in row and pd.notna(row['reasoning']) and 'new_reasoning' not in row:
                         st.markdown("**Reasoning:**")
                         st.info(row['reasoning'])
 
@@ -170,7 +180,18 @@ def main():
                     lambda x: x[:100] + '...' if len(str(x)) > 100 else x
                 )
 
-            # Truncate reasoning too
+            # Truncate reasoning columns
+            if 'original_reasoning' in display_df.columns:
+                display_df['original_reasoning'] = display_df['original_reasoning'].apply(
+                    lambda x: x[:100] + '...' if pd.notna(x) and len(str(x)) > 100 else x
+                )
+
+            if 'new_reasoning' in display_df.columns:
+                display_df['new_reasoning'] = display_df['new_reasoning'].apply(
+                    lambda x: x[:100] + '...' if pd.notna(x) and len(str(x)) > 100 else x
+                )
+
+            # Fallback for older format
             if 'reasoning' in display_df.columns:
                 display_df['reasoning'] = display_df['reasoning'].apply(
                     lambda x: x[:100] + '...' if pd.notna(x) and len(str(x)) > 100 else x

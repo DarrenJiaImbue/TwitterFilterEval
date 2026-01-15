@@ -154,7 +154,11 @@ class DatasetLoader:
         non_hate_speech = []
 
         with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
+            # Skip comment lines starting with #
+            lines = [line for line in f if not line.startswith('#')]
+
+            import io
+            reader = csv.DictReader(io.StringIO(''.join(lines)))
             for row in reader:
                 # Skip duplicate header rows
                 if row['Label'] == 'Label':
@@ -162,11 +166,12 @@ class DatasetLoader:
 
                 content = row['Content']
                 label = int(row['Label'])
+                original_reasoning = row.get('Reasoning', '')  # Get original reasoning if available
 
                 if label == 1:
-                    hate_speech.append({'content': content, 'label': label})
+                    hate_speech.append({'content': content, 'label': label, 'original_reasoning': original_reasoning})
                 else:
-                    non_hate_speech.append({'content': content, 'label': label})
+                    non_hate_speech.append({'content': content, 'label': label, 'original_reasoning': original_reasoning})
 
         print(f"Found {len(hate_speech)} hate speech samples and {len(non_hate_speech)} non-hate speech samples")
 
@@ -217,27 +222,29 @@ class EvaluationHarness:
             async with semaphore:
                 texts = [item['content'] for item in batch]
                 ground_truth = [item['label'] for item in batch]
+                original_reasoning = [item.get('original_reasoning', '') for item in batch]
 
                 batch_start_time = time.time()
                 predictions = await self.classifier.classify_batch(texts)
                 batch_elapsed_time = time.time() - batch_start_time
 
-                return texts, predictions, ground_truth, batch_elapsed_time
+                return texts, predictions, ground_truth, original_reasoning, batch_elapsed_time
 
         # Process all batches concurrently with progress tracking
         tasks = [process_batch(batch) for batch in batches]
 
         for coro in atqdm.as_completed(tasks, total=len(tasks), desc="Processing batches"):
-            texts, predictions, ground_truth, batch_elapsed_time = await coro
+            texts, predictions, ground_truth, original_reasoning, batch_elapsed_time = await coro
             batch_times.append(batch_elapsed_time)
 
             # Record results
-            for text, (pred, reasoning), truth in zip(texts, predictions, ground_truth):
+            for text, (pred, reasoning), truth, orig_reasoning in zip(texts, predictions, ground_truth, original_reasoning):
                 results.append({
                     'message': text,
                     'predicted_label': pred,
                     'ground_truth': truth,
-                    'reasoning': reasoning,
+                    'original_reasoning': orig_reasoning,
+                    'new_reasoning': reasoning,
                     'correct': pred == truth
                 })
 
@@ -311,7 +318,7 @@ class EvaluationHarness:
             f.write("#\n")
 
             # Write results
-            writer = csv.DictWriter(f, fieldnames=['message', 'predicted_label', 'ground_truth', 'reasoning', 'correct'])
+            writer = csv.DictWriter(f, fieldnames=['message', 'predicted_label', 'ground_truth', 'original_reasoning', 'new_reasoning', 'correct'])
             writer.writeheader()
             writer.writerows(results)
 
@@ -325,10 +332,10 @@ async def main():
         raise ValueError("ANTHROPIC_API_KEY not found in environment. Please set it in .env file")
 
     # Configuration
-    DATASET_PATH = 'HateSpeechDataset.csv'
+    DATASET_PATH = 'claude_labeled_dataset_20260115_141034.csv'
     SAMPLES_PER_CLASS = 500  # Adjust this to control dataset size
     BATCH_SIZE = 10  # Number of texts to classify in one API call
-    MAX_CONCURRENT = 10  # Maximum number of concurrent API requests
+    MAX_CONCURRENT = 40  # Maximum number of concurrent API requests
 
     # Load and balance dataset
     dataset = DatasetLoader.load_and_balance(DATASET_PATH, samples_per_class=SAMPLES_PER_CLASS)
@@ -336,7 +343,7 @@ async def main():
     # Create classifier
     classifier = ClaudeClassifier(
         api_key=api_key,
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         batch_size=BATCH_SIZE,
         max_concurrent=MAX_CONCURRENT
     )
