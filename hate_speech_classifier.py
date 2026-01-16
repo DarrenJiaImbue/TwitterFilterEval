@@ -20,7 +20,9 @@ from tqdm.asyncio import tqdm as atqdm
 
 # Optional: Import for HuggingFace classifier
 try:
-    from transformers import pipeline
+    from transformers import pipeline, AutoTokenizer, AutoModel
+    import torch
+    import torch.nn.functional as F
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
@@ -326,6 +328,260 @@ class HuggingFaceZeroShotClassifier(BaseClassifier):
         print(f"{'='*60}")
 
 
+class EmbeddingSimilarityClassifier(BaseClassifier):
+    """Embedding-based classifier using cosine similarity with hate speech examples.
+
+    Compatible with both Python (transformers) and JavaScript (Transformers.js).
+    Recommended model: Xenova/all-MiniLM-L6-v2
+    """
+
+    # ~50 hate speech examples for similarity comparison
+    HATE_SPEECH_EXAMPLES = [
+        "I hate all people from that country",
+        "They should all be killed",
+        "You're such a disgusting person",
+        "Go back to where you came from",
+        "You people are ruining everything",
+        "I wish they would all die",
+        "Your kind doesn't belong here",
+        "You're nothing but trash",
+        "They're all criminals and thugs",
+        "I hope you get what you deserve",
+        "You're subhuman filth",
+        "Your race is inferior",
+        "Women are stupid and worthless",
+        "Men are all pigs and should suffer",
+        "You deserve to be hurt",
+        "I hope someone beats you up",
+        "You're a waste of oxygen",
+        "The world would be better without your kind",
+        "You people are all the same - worthless",
+        "I hate everyone like you",
+        "Your religion is evil and you're all terrorists",
+        "Gay people are disgusting and wrong",
+        "You should be ashamed of who you are",
+        "People like you make me sick",
+        "I hope terrible things happen to you",
+        "You don't deserve to live",
+        "Your community is full of degenerates",
+        "I wish violence upon all of you",
+        "You're all parasites on society",
+        "Get out of my country, you don't belong",
+        "Your entire group is worthless trash",
+        "I hope you all suffer",
+        "You people are a disease",
+        "The only good one is a dead one",
+        "You deserve all the hate you get",
+        "I'd be happy if you all disappeared",
+        "Your kind ruins everything you touch",
+        "You're animals, not humans",
+        "I hate your entire race/religion/group",
+        "You should all be removed from society",
+        "Nobody wants you here",
+        "You're all ugly and disgusting",
+        "I hope you experience pain and suffering",
+        "Your people are all liars and thieves",
+        "The world doesn't need people like you",
+        "You're all stupid and inferior",
+        "I wish harm upon your entire community",
+        "You're a plague on humanity",
+        "Go die in a hole somewhere",
+        "You're all worthless scum"
+    ]
+
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+                 batch_size: int = 10, device: int = -1, threshold: float = 0.5):
+        """
+        Initialize the embedding similarity classifier.
+
+        Args:
+            model_name: HuggingFace model name (use models compatible with Transformers.js)
+            batch_size: Number of texts to classify at once
+            device: Device to run on (-1 for CPU, 0+ for GPU)
+            threshold: Similarity threshold for classifying as hate speech (default: 0.5)
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            raise ImportError("transformers and torch are required. Install with: pip install transformers torch")
+
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.device_id = device
+        self.threshold = threshold
+
+        # Set device
+        if device == -1:
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+
+        print(f"Loading embedding model {model_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+        print("Model loaded successfully!")
+
+        # Pre-compute embeddings for hate speech examples
+        print("Computing embeddings for hate speech examples...")
+        self.hate_embeddings = self._compute_embeddings_sync(self.HATE_SPEECH_EXAMPLES)
+        print(f"Precomputed {len(self.hate_embeddings)} hate speech example embeddings")
+
+    def _mean_pooling(self, model_output, attention_mask):
+        """Mean pooling to get sentence embeddings"""
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    def _compute_embeddings_sync(self, texts: List[str]) -> torch.Tensor:
+        """Compute embeddings for a list of texts (synchronous)"""
+        with torch.no_grad():
+            encoded_input = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
+            model_output = self.model(**encoded_input)
+            embeddings = self._mean_pooling(model_output, encoded_input['attention_mask'])
+            # Normalize embeddings
+            embeddings = F.normalize(embeddings, p=2, dim=1)
+        return embeddings
+
+    def _compute_max_similarity(self, text_embedding: torch.Tensor) -> float:
+        """Compute maximum cosine similarity between text and hate speech examples"""
+        # Compute cosine similarities with all hate speech examples
+        similarities = torch.mm(text_embedding, self.hate_embeddings.t())
+        # Get maximum similarity
+        max_similarity = torch.max(similarities).item()
+        return max_similarity
+
+    async def classify_batch(self, texts: List[str]) -> List[Tuple[int, str]]:
+        """Classify a batch of texts using embedding similarity"""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, self._classify_sync, texts)
+        return results
+
+    def _classify_sync(self, texts: List[str]) -> List[Tuple[int, str]]:
+        """Synchronous classification method"""
+        try:
+            # Compute embeddings for input texts
+            text_embeddings = self._compute_embeddings_sync(texts)
+
+            classifications = []
+            for i, text_embedding in enumerate(text_embeddings):
+                # Compute maximum similarity with hate speech examples
+                max_similarity = self._compute_max_similarity(text_embedding.unsqueeze(0))
+
+                # Apply threshold
+                label = 1 if max_similarity >= self.threshold else 0
+
+                # Store similarity score as reasoning
+                reasoning = f"{max_similarity:.4f}"
+
+                classifications.append((label, reasoning))
+
+            return classifications
+
+        except Exception as e:
+            print(f"Error classifying batch: {e}")
+            # Return default classifications on error
+            return [(0, f"Error: {str(e)}") for _ in texts]
+
+    def get_name(self) -> str:
+        # Extract a shorter model name
+        model_short = self.model_name.split('/')[-1].replace('-', '_')
+        return f"embedding_{model_short}_t{self.threshold}_batch{self.batch_size}"
+
+    def calculate_optimal_threshold(self, results: List[Dict]):
+        """Calculate and display the optimal threshold for classification"""
+        print(f"\n{'='*60}")
+        print("OPTIMAL THRESHOLD ANALYSIS")
+        print(f"{'='*60}")
+
+        # Test thresholds from 0.0 to 1.0
+        thresholds = [i / 100.0 for i in range(0, 101)]
+        best_threshold = 0.5
+        best_accuracy = 0.0
+        best_metrics = {}
+
+        threshold_results = []
+
+        for threshold in thresholds:
+            # Recalculate predictions with this threshold
+            tp = fp = fn = tn = 0
+
+            for r in results:
+                # Extract similarity from reasoning string
+                try:
+                    similarity = float(r.get('new_reasoning', '0'))
+                except ValueError:
+                    continue
+
+                pred = 1 if similarity >= threshold else 0
+                truth = r['ground_truth']
+
+                if pred == 1 and truth == 1:
+                    tp += 1
+                elif pred == 1 and truth == 0:
+                    fp += 1
+                elif pred == 0 and truth == 1:
+                    fn += 1
+                else:
+                    tn += 1
+
+            # Calculate metrics
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+
+            threshold_results.append({
+                'threshold': threshold,
+                'f1': f1,
+                'precision': precision,
+                'recall': recall,
+                'accuracy': accuracy,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn,
+                'tn': tn
+            })
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_threshold = threshold
+                best_metrics = {
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
+                    'tp': tp,
+                    'fp': fp,
+                    'fn': fn,
+                    'tn': tn
+                }
+
+        # Print optimal threshold
+        print(f"\nOptimal Threshold (by Accuracy): {best_threshold:.4f}")
+        print(f"  Accuracy:  {best_accuracy:.4f}")
+        print(f"  F1 Score:  {best_metrics['f1']:.4f}")
+        print(f"  Precision: {best_metrics['precision']:.4f}")
+        print(f"  Recall:    {best_metrics['recall']:.4f}")
+        print(f"\n  Confusion Matrix at Optimal Threshold:")
+        print(f"    TP: {best_metrics['tp']}  FP: {best_metrics['fp']}")
+        print(f"    FN: {best_metrics['fn']}  TN: {best_metrics['tn']}")
+
+        # Show current threshold metrics
+        current_metrics = next((t for t in threshold_results if abs(t['threshold'] - self.threshold) < 0.001), None)
+        if current_metrics:
+            print(f"\nCurrent Threshold: {self.threshold:.4f}")
+            print(f"  F1 Score:  {current_metrics['f1']:.4f}")
+            print(f"  Accuracy:  {current_metrics['accuracy']:.4f}")
+            print(f"  Precision: {current_metrics['precision']:.4f}")
+            print(f"  Recall:    {current_metrics['recall']:.4f}")
+
+            improvement = best_accuracy - current_metrics['accuracy']
+            if improvement > 0.001:
+                print(f"\n  💡 Accuracy could improve by {improvement:.4f} ({improvement*100:.2f}%) with optimal threshold")
+            else:
+                print(f"\n  ✅ Current threshold is already optimal!")
+
+        print(f"{'='*60}")
+
+
 class DatasetLoader:
     """Handles loading and balancing the dataset"""
 
@@ -361,7 +617,7 @@ class DatasetLoader:
 
         # Balance the dataset
         import random
-        random.seed(42)  # For reproducibility
+        random.seed(40)  # For reproducibility
 
         hate_speech_sample = random.sample(hate_speech, min(samples_per_class, len(hate_speech)))
         non_hate_speech_sample = random.sample(non_hate_speech, min(samples_per_class, len(non_hate_speech)))
@@ -484,8 +740,8 @@ class EvaluationHarness:
         print(f"  Number of batches: {len(batch_times)}")
         print(f"\nResults saved to {output_path}")
 
-        # Calculate optimal threshold for zero-shot classifiers
-        if isinstance(self.classifier, HuggingFaceZeroShotClassifier):
+        # Calculate optimal threshold for zero-shot and embedding classifiers
+        if isinstance(self.classifier, (HuggingFaceZeroShotClassifier, EmbeddingSimilarityClassifier)):
             self.classifier.calculate_optimal_threshold(results)
 
         print(f"{'='*60}")
@@ -541,11 +797,22 @@ async def main():
 
     # Option 2: HuggingFace Zero-Shot Classifier (requires transformers and torch)
     # Uncomment the following lines to use the HuggingFace classifier instead:
-    classifier = HuggingFaceZeroShotClassifier(
-        model_name="MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+    # classifier = HuggingFaceZeroShotClassifier(
+    #     model_name="MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
+    #     batch_size=BATCH_SIZE,
+    #     device=-1,  # Use -1 for CPU, 0 for GPU
+    #     threshold=0.02  # Confidence threshold (will calculate optimal threshold after evaluation)
+    # )
+
+    # Option 3: Embedding Similarity Classifier (requires transformers and torch)
+    # Uses cosine similarity with hate speech examples. Compatible with Transformers.js for Chrome extensions!
+    # For first-pass filtering: use LOW threshold to catch more hate speech (high recall)
+    # False positives are OK since LLM will do second-pass filtering
+    classifier = EmbeddingSimilarityClassifier(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",  # Also available as Xenova/all-MiniLM-L6-v2 in Transformers.js
         batch_size=BATCH_SIZE,
         device=-1,  # Use -1 for CPU, 0 for GPU
-        threshold=0.02  # Confidence threshold (will calculate optimal threshold after evaluation)
+        threshold=0.3
     )
 
     if classifier is None:
