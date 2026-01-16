@@ -29,6 +29,11 @@ python hate_speech_classifier.py
 ```
 This will generate the results file for viewing.
 
+View them with
+```bash
+streamlit run results_viewer.py 
+```
+
 ## Dataset
 
 The original dataset (`HateSpeechDataset.csv`) contains:
