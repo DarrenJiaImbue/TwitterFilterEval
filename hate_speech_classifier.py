@@ -18,6 +18,14 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
+# Optional: Import for HuggingFace classifier
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("Warning: transformers not available. HuggingFace classifier will not work.")
+
 
 class BaseClassifier(ABC):
     """Base class for all classifiers"""
@@ -140,6 +148,182 @@ For each tweet, provide your reasoning and decision in the format specified in y
 
     def get_name(self) -> str:
         return f"claude_{self.model.split('-')[1]}_batch{self.batch_size}"
+
+
+class HuggingFaceZeroShotClassifier(BaseClassifier):
+    """Zero-shot classifier using HuggingFace transformers"""
+
+    def __init__(self, model_name: str = "MoritzLaurer/deberta-v3-base-zeroshot-v2.0", batch_size: int = 10, device: int = -1, threshold: float = 0.5):
+        """
+        Initialize the zero-shot classifier.
+
+        Args:
+            model_name: HuggingFace model name
+            batch_size: Number of texts to classify at once
+            device: Device to run on (-1 for CPU, 0+ for GPU)
+            threshold: Confidence threshold for classifying as hate speech (default: 0.5)
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            raise ImportError("transformers library is required for HuggingFaceZeroShotClassifier. Install with: pip install transformers torch")
+
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.device = device
+        self.threshold = threshold
+
+        print(f"Loading model {model_name}...")
+        self.pipe = pipeline("zero-shot-classification", model=model_name, device=device)
+        print("Model loaded successfully!")
+
+        # Use only "hate speech" as the label to get direct confidence score
+        self.hypothesis_template = "This text contains {}"
+        self.candidate_labels = ["hate speech"]
+
+    async def classify_batch(self, texts: List[str]) -> List[Tuple[int, str]]:
+        """Classify a batch of texts using zero-shot classification"""
+        # Run the classification (synchronous, but we'll wrap it for async compatibility)
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, self._classify_sync, texts)
+        return results
+
+    def _classify_sync(self, texts: List[str]) -> List[Tuple[int, str]]:
+        """Synchronous classification method"""
+        try:
+            # Process all texts in the batch at once
+            results = self.pipe(texts, self.candidate_labels, hypothesis_template=self.hypothesis_template, multi_label=False)
+
+            classifications = []
+            for result in results:
+                # Get confidence score for "hate speech"
+                confidence = result['scores'][0]
+
+                # Apply threshold to determine label
+                label = 1 if confidence >= self.threshold else 0
+
+                # Store just the confidence value as reasoning for easier extraction
+                reasoning = str(confidence)
+
+                classifications.append((label, reasoning))
+
+            return classifications
+
+        except Exception as e:
+            print(f"Error classifying batch: {e}")
+            # Fallback to one-at-a-time if batched processing fails
+            print("Falling back to individual classification...")
+            classifications = []
+            for text in texts:
+                try:
+                    result = self.pipe(text, self.candidate_labels, hypothesis_template=self.hypothesis_template, multi_label=False)
+                    confidence = result['scores'][0]
+                    label = 1 if confidence >= self.threshold else 0
+                    reasoning = str(confidence)
+                    classifications.append((label, reasoning))
+                except Exception as e2:
+                    print(f"Error classifying individual text: {e2}")
+                    classifications.append((0, f"Error during classification: {str(e2)}"))
+
+            return classifications
+
+    def get_name(self) -> str:
+        # Extract a shorter model name
+        model_short = self.model_name.split('/')[-1].replace('-', '_')
+        return f"hf_{model_short}_t{self.threshold}_batch{self.batch_size}"
+
+    def calculate_optimal_threshold(self, results: List[Dict]):
+        """Calculate and display the optimal threshold for classification"""
+        print(f"\n{'='*60}")
+        print("OPTIMAL THRESHOLD ANALYSIS")
+        print(f"{'='*60}")
+
+        # Test thresholds from 0.0 to 1.0
+        thresholds = [i / 100.0 for i in range(0, 101)]
+        best_threshold = 0.5
+        best_accuracy = 0.0
+        best_metrics = {}
+
+        threshold_results = []
+
+        for threshold in thresholds:
+            # Recalculate predictions with this threshold
+            tp = fp = fn = tn = 0
+
+            for r in results:
+                # Extract confidence from reasoning string (just the confidence value)
+                try:
+                    conf = float(r.get('new_reasoning', '0'))
+                except ValueError:
+                    continue
+
+                pred = 1 if conf >= threshold else 0
+                truth = r['ground_truth']
+
+                if pred == 1 and truth == 1:
+                    tp += 1
+                elif pred == 1 and truth == 0:
+                    fp += 1
+                elif pred == 0 and truth == 1:
+                    fn += 1
+                else:
+                    tn += 1
+
+            # Calculate metrics
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+
+            threshold_results.append({
+                'threshold': threshold,
+                'f1': f1,
+                'precision': precision,
+                'recall': recall,
+                'accuracy': accuracy,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn,
+                'tn': tn
+            })
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                best_threshold = threshold
+                best_metrics = {
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
+                    'tp': tp,
+                    'fp': fp,
+                    'fn': fn,
+                    'tn': tn
+                }
+
+        # Print optimal threshold
+        print(f"\nOptimal Threshold (by Accuracy): {best_threshold:.4f}")
+        print(f"  Accuracy:  {best_accuracy:.4f}")
+        print(f"  F1 Score:  {best_metrics['f1']:.4f}")
+        print(f"  Precision: {best_metrics['precision']:.4f}")
+        print(f"  Recall:    {best_metrics['recall']:.4f}")
+        print(f"\n  Confusion Matrix at Optimal Threshold:")
+        print(f"    TP: {best_metrics['tp']}  FP: {best_metrics['fp']}")
+        print(f"    FN: {best_metrics['fn']}  TN: {best_metrics['tn']}")
+
+        # Show current threshold metrics
+        current_metrics = next((t for t in threshold_results if abs(t['threshold'] - self.threshold) < 0.001), None)
+        if current_metrics:
+            print(f"\nCurrent Threshold: {self.threshold:.4f}")
+            print(f"  F1 Score:  {current_metrics['f1']:.4f}")
+            print(f"  Accuracy:  {current_metrics['accuracy']:.4f}")
+            print(f"  Precision: {current_metrics['precision']:.4f}")
+            print(f"  Recall:    {current_metrics['recall']:.4f}")
+
+            improvement = best_accuracy - current_metrics['accuracy']
+            if improvement > 0.001:
+                print(f"\n  💡 Accuracy could improve by {improvement:.4f} ({improvement*100:.2f}%) with optimal threshold")
+            else:
+                print(f"\n  ✅ Current threshold is already optimal!")
+
+        print(f"{'='*60}")
 
 
 class DatasetLoader:
@@ -299,6 +483,11 @@ class EvaluationHarness:
         print(f"  Avg time per batch: {avg_batch_time:.2f}s")
         print(f"  Number of batches: {len(batch_times)}")
         print(f"\nResults saved to {output_path}")
+
+        # Calculate optimal threshold for zero-shot classifiers
+        if isinstance(self.classifier, HuggingFaceZeroShotClassifier):
+            self.classifier.calculate_optimal_threshold(results)
+
         print(f"{'='*60}")
 
     def _save_results(self, results: List[Dict], output_path: str, metrics: Dict):
@@ -328,9 +517,6 @@ async def main():
     load_dotenv()
     api_key = os.getenv('ANTHROPIC_API_KEY')
 
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment. Please set it in .env file")
-
     # Configuration
     DATASET_PATH = 'claude_labeled_dataset_20260115_141034.csv'
     SAMPLES_PER_CLASS = 500  # Adjust this to control dataset size
@@ -340,13 +526,30 @@ async def main():
     # Load and balance dataset
     dataset = DatasetLoader.load_and_balance(DATASET_PATH, samples_per_class=SAMPLES_PER_CLASS)
 
-    # Create classifier
-    classifier = ClaudeClassifier(
-        api_key=api_key,
-        model="claude-haiku-4-5-20251001",
+    # ========== CHOOSE YOUR CLASSIFIER ==========
+    # Option 1: Claude Classifier (requires ANTHROPIC_API_KEY)
+    # if not api_key:
+    #     print("Warning: ANTHROPIC_API_KEY not found in environment. Skipping Claude classifier.")
+    #     classifier = None
+    # else:
+    #     classifier = ClaudeClassifier(
+    #         api_key=api_key,
+    #         model="claude-haiku-4-5-20251001",
+    #         batch_size=BATCH_SIZE,
+    #         max_concurrent=MAX_CONCURRENT
+    #     )
+
+    # Option 2: HuggingFace Zero-Shot Classifier (requires transformers and torch)
+    # Uncomment the following lines to use the HuggingFace classifier instead:
+    classifier = HuggingFaceZeroShotClassifier(
+        model_name="MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
         batch_size=BATCH_SIZE,
-        max_concurrent=MAX_CONCURRENT
+        device=-1,  # Use -1 for CPU, 0 for GPU
+        threshold=0.02  # Confidence threshold (will calculate optimal threshold after evaluation)
     )
+
+    if classifier is None:
+        raise ValueError("No classifier configured. Please set up API keys or uncomment a classifier option.")
 
     # Create output filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
