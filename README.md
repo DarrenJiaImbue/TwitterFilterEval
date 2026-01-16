@@ -2,14 +2,6 @@
 
 A testing harness for evaluating different hate speech classification methods on Twitter data.
 
-## Features
-
-- **Balanced Dataset**: Automatically creates a balanced subset from the original dataset
-- **Batching Support**: Reduces API calls by processing multiple texts in one request
-- **Extensible Architecture**: Easy to add new classification methods (embeddings, other LLMs, etc.)
-- **Comprehensive Metrics**: Accuracy, precision, recall, F1 score, and confusion matrix
-- **Detailed Results**: CSV output with each message, prediction, and ground truth
-
 ## Setup
 
 1. Install dependencies:
@@ -23,28 +15,19 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the evaluation:
+Start by running 
+```bash
+python generate_claude_labels.py
+```
+This will download the data set and make sonnet generate labels for whether a message is hate speech or not. The original data set classifies all hateful language as hate speech so arguments between users and profanity often get marked as hate speech when I think they shouldn't.
+Since we are taking sonnet's interpretation as the ground truth, the accuracy of the other classification methods will be a measure of how similar they are to sonnet.
+
+After uncommenting the classification method you want to run:
+
 ```bash
 python hate_speech_classifier.py
 ```
-
-### Configuration
-
-You can modify these parameters in `hate_speech_classifier.py`:
-
-```python
-SAMPLES_PER_CLASS = 500   # Number of samples per class (hate/non-hate)
-BATCH_SIZE = 5            # Number of texts to classify per API call
-```
-
-## Output
-
-The script generates a timestamped CSV file with results:
-- `results_claude_sonnet_batch5_YYYYMMDD_HHMMSS.csv`
-
-The file includes:
-- Header with classifier name, timestamp, and metrics
-- Each row: message, predicted_label, ground_truth, correct
+This will generate the results file for viewing.
 
 ## Dataset
 
@@ -54,73 +37,37 @@ The original dataset (`HateSpeechDataset.csv`) contains:
 
 The harness automatically balances this by sampling equal amounts from each class.
 
-## Architecture
+## Takeaways
+### Sonnet 4.5
+Accuracy: 88.2
 
-### BaseClassifier
-Abstract base class for all classifiers. Implement this to add new methods:
+Batch Time: 10.45s
 
-```python
-class MyClassifier(BaseClassifier):
-    def classify_batch(self, texts: List[str]) -> List[int]:
-        # Your classification logic
-        pass
+Sonnet is the slowest and takes 10.45 to classify 10 tweets.
+Something to note about Sonnet 4.5 is that it has 88% accuracy when reclassifying the data points (probably because of temperature) so that is our max accuracy.
 
-    def get_name(self) -> str:
-        return "my_classifier"
-```
+### Haiku 4.5
+Accuracy: 83.30
 
-### ClaudeClassifier
-Current implementation using Claude Sonnet 4 with batching support.
+Batch Time: 3.83s
 
-### Future Extensions
+Haiku is very fast and and almost just as accurate as Sonnet for this task. If we ant to use a Claude model this is probably it.
 
-To add embedding-based classification:
+### Deberta
+Accuracy: 69.20
 
-```python
-class EmbeddingClassifier(BaseClassifier):
-    def __init__(self, embedding_model, threshold=0.8):
-        self.model = embedding_model
-        self.threshold = threshold
-        # Load hate speech examples and compute embeddings
+Batch Time: 5.42s
 
-    def classify_batch(self, texts: List[str]) -> List[int]:
-        # Compute embeddings and cosine similarity
-        # Compare to threshold
-        pass
+Open source model run locally on my cpu. Accuracy and speed are worse than haiku but this does solve the privacy and cost issue since people can run it locally. Should work in a chrome extension via the transformers.js library. Alternatively we could spin up an AWS instance with a nice GPU and host it ourselves. The added latency might make this not worth for some users and I guess users would have to trust us not to take their data.
 
-    def get_name(self) -> str:
-        return "embedding_cosine"
-```
+Deberta returns a number in [0,1] to represent the confidence for whether the text is related to a category. The optimal threshold does generalize to the rest of the hate speech dataset but I suspect that a different category/dataset would require a different threshold. This also applies to the next method.
+### Embedding Vectors + Cosine similarity
 
-Then use it in `main()`:
-```python
-classifier = EmbeddingClassifier(your_embedding_model)
-```
+Accuracy: 63.60
 
-## Metrics
+Batch Time: 0.07s
 
-The harness calculates:
-- **Accuracy**: Overall correctness
-- **Precision**: Of predicted hate speech, how many were actually hate speech
-- **Recall**: Of actual hate speech, how many were detected
-- **F1 Score**: Harmonic mean of precision and recall
-- **Confusion Matrix**: TP, FP, TN, FN
+I had claude generate 50 sample hate speech strings and found the cosine similarity between each tweet and these 50 strings. If it's over some threshold then it's hate speech.
 
-## Example Output
-
-```
-==============================================================
-Results for claude_sonnet_batch5
-==============================================================
-Accuracy:  0.9450 (945/1000)
-Precision: 0.9320
-Recall:    0.9580
-F1 Score:  0.9448
-
-Confusion Matrix:
-  TP: 479  FP: 35
-  FN: 21  TN: 465
-
-Results saved to results_claude_sonnet_batch5_20260115_143022.csv
-==============================================================
-```
+Blazing fast and can be run in a chrome extension via transformers.js. Kind of inaccurate and also requires finding the right threshold value. I think this would be useful as a first pass filter before passing to some LLM.
+The only issue is that theres a lot of overlap in value between hate speech and non hate speech strings. Maybe I can tune the sample strings to make this better? 
